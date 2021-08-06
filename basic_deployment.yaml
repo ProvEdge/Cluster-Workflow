@@ -1,0 +1,478 @@
+metadata:
+  name: basic-workflow
+spec:
+  entrypoint: work-flow
+  arguments:
+    parameters:
+      - name: cloudtoken
+        value: ""
+      - name: mastercount
+        value: 3
+      - name: workercount
+        value: 3
+      - name: clustername
+        value: ""
+      - name: storage-size
+        value: 150
+  templates:
+    - name: work-flow
+      dag:
+        tasks:
+          - name: ssh-crea # hello1 is run before the following tasks
+            template: ssh-key-c
+          - name: terra-apply # double dash => run after previous step
+            dependencies: [ssh-crea]
+            template: terra
+            arguments:
+              artifacts:
+                - name: ssh-key
+                  from: "{{tasks.ssh-crea.outputs.artifacts.ssh-key}}"
+          - name: k8s-creator
+            dependencies: [terra-apply]
+            template: kubeone-creator
+            arguments:
+              artifacts:
+                - name: ssh-key-reach
+                  from: "{{tasks.ssh-crea.outputs.artifacts.ssh-key}}"
+                - name: tfstate
+                  from: "{{tasks.terra-apply.outputs.artifacts.tfstate}}"
+          - name: rook-ceph
+            dependencies: [k8s-creator]
+            template: rook-ceph-deployer
+            arguments:
+              artifacts:
+                - name: k8s-state
+                  from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+          - name: delay
+            dependencies: [rook-ceph]
+            template: delay
+          # - name: kubesphere
+          #   dependencies: [delay]
+          #   template: kubesphere-deploy
+          #   arguments:
+          #     artifacts:
+          #     - name: k8s-state
+          #       from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+          # - name: kubesphere-init
+          #   dependencies: [kubesphere]
+          #   template: pod-wait
+          - name: destroying-machinedeployments
+            dependencies: [k8s-destroyer]
+            template: pod-wait
+          # - name: kubesphere-logs
+          #   dependencies: [kubesphere-init]
+          #   template: kubesphere-report
+          #   arguments:
+          #     artifacts:
+          #       - name: k8s-state
+          #         from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+          - name: approve
+            dependencies: [k8s-creator]
+            template: approve
+          - name: k8s-destroyer
+            dependencies: [approve]
+            template: kubeone-destroyer
+            arguments:
+              artifacts:
+                - name: ssh-key
+                  from: "{{tasks.ssh-crea.outputs.artifacts.ssh-key}}"
+                - name: k8s-state
+                  from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+          - name: terra-destroy
+            dependencies: [destroying-machinedeployments]
+            template: terra-destroy
+            arguments:
+              artifacts:
+                - name: ssh-key
+                  from: "{{tasks.ssh-crea.outputs.artifacts.ssh-key}}"
+                - name: tfstate
+                  from: "{{tasks.terra-apply.outputs.artifacts.tfstate}}"
+          # - name: delay2
+          #   dependencies: [kubesphere]
+          #   template: delay
+          # - name: wait-before-integration
+          #   dependencies: [application-creator]
+          #   template: pod-wait
+          # - name: kubesphere-integrate
+          #   dependencies: [wait-before-integration]
+          #   template: kubesphere-integrator
+          #   arguments:
+          #     artifacts:
+          #       - name: k8s-state
+          #         from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+          # - name: application-creator
+          #   dependencies: [k8s-creator]
+          #   template: app-install
+          #   arguments:
+          #     artifacts:
+          #       - name: k8s-state
+          #         from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+          # # - name: ansible-docker-edit
+          #   dependencies: [dex-kubeapps]
+          #   template: ansible-docker-edit
+          #   arguments:
+          #     artifacts:
+          #       - name: k8s-state
+          #         from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+          #       - name: ssh-key
+          #         from: "{{tasks.ssh-crea.outputs.artifacts.ssh-key}}"
+          # - name: delay3
+          #   dependencies: [kubesphere-integrate]
+          #   template: pod-wait
+          # - name: certs
+          #   dependencies: [delay3]
+          #   template: ssl-cert
+          #   arguments:
+          #     artifacts:
+          #       - name: k8s-state
+          #         from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+          # - name: ansible-api
+          #   dependencies: [ansible-docker-edit]
+          #   template: api-server
+          #   arguments:
+          #     artifacts:
+          #       - name: k8s-state
+          #         from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+          #       - name: ssh-key
+          #         from: "{{tasks.ssh-crea.outputs.artifacts.ssh-key}}"
+          #       - name: certs
+          #         from: "{{tasks.certs.outputs.artifacts.certs}}"
+          # - name: dex-kubeapps
+          #   dependencies: [certs]
+          #   template: dex-kubeapps
+          #   arguments:
+          #     artifacts:
+          #       - name: k8s-state
+          #         from: "{{tasks.k8s-creator.outputs.artifacts.k8s-state}}"
+    - name: approve
+      suspend: {}
+    - name: delay
+      suspend:
+        duration: "300"
+    - name: pod-wait
+      suspend:
+        duration: "60"
+    - name: ssh-key-c
+      outputs:
+        artifacts:
+          - name: ssh-key
+            path: /home/ssh-key
+      script:
+        image: "hashicorp/terraform"
+        command: [sh]
+        source: |
+          mkdir /home/ssh-key 
+          ssh-keygen -f /home/ssh-key/key -N ''
+    - name: terra
+      inputs:
+        artifacts:
+          # Check out the master branch of the argo repo and place it at /src
+          # revision can be anything that git checkout accepts: branch, commit, tag, etc.
+          - name: infra
+            path: /src
+            git:
+              repo: https://github.com/esgungor/infra.git
+              revision: "main"
+          - name: ssh-key
+            path: /home/ssh-key
+      outputs:
+        artifacts:
+          - name: tfstate
+            path: /src
+      script:
+        image: "hashicorp/terraform"
+        command: [sh]
+        source: |
+          cd /src 
+          terraform init 
+          export TF_VAR_ssh_public_key_file=/home/ssh-key/key.pub
+          export TF_VAR_ssh_private_key_file=/home/ssh-key/key
+          export TF_VAR_workers_replicas={{workflow.parameters.workercount}}
+          export TF_VAR_master_count={{workflow.parameters.mastercount}}
+          export TF_VAR_cluster_name={{workflow.parameters.clustername}}
+          export TF_VAR_storage_size={{workflow.parameters.storage-size}} 
+          export HCLOUD_TOKEN={{workflow.parameters.cloudtoken}} 
+          terraform apply -auto-approve
+          terraform output -json > tf.json
+    - name: kubeone-creator
+      inputs:
+        artifacts:
+          - name: tfstate
+            path: /src
+          - name: ssh-key-reach
+            path: /home/ssh-key
+      outputs:
+        artifacts:
+          - name: k8s-state
+            path: /src
+      script:
+        image: "enginsgungor/kubeone:v1"
+        command: [sh]
+        source: |
+          cd /src 
+          eval `ssh-agent`
+          ssh-add /home/ssh-key/key
+          export HCLOUD_TOKEN={{workflow.parameters.cloudtoken}}
+          kubeone apply --manifest kubeone.yaml -t tf.json --auto-approve
+    - name: kubeone-destroyer
+      inputs:
+        artifacts:
+          - name: k8s-state
+            path: /src
+          - name: ssh-key
+            path: /home/ssh-key
+      script:
+        image: "enginsgungor/kubeone:v2"
+        command: [sh]
+        source: |
+          cd /src
+          eval `ssh-agent`
+          ssh-add /home/ssh-key/key
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig 
+          export HCLOUD_TOKEN={{workflow.parameters.cloudtoken}}
+          kubectl scale -n kube-system machinedeployment {{workflow.parameters.clustername}}-pool1 --replicas=0
+          kubeone config machinedeployments --manifest kubeone.yaml -t tf.json
+    - name: terra-destroy
+      inputs:
+        artifacts:
+          - name: ssh-key
+            path: /home/ssh-key
+          - name: tfstate
+            path: /src
+      script:
+        image: "hashicorp/terraform"
+        command: [sh]
+        source: |
+          cd /src 
+          export TF_VAR_ssh_public_key_file=/home/ssh-key/key.pub 
+          export TF_VAR_cluster_name={{workflow.parameters.clustername}} 
+          export HCLOUD_TOKEN={{workflow.parameters.cloudtoken}} 
+          terraform destroy -auto-approve
+    - name: rook-ceph-deployer
+      inputs:
+        artifacts:
+          - name: k8s-state
+            path: /src
+          - name: rook-repo
+            path: /home/rook
+            git:
+              repo: https://github.com/esgungor/rook-ceph.git
+              revision: "master"
+      script:
+        image: "enginsgungor/kubemanager:v1"
+        command: [sh]
+        source: |
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig
+          cd /home/rook
+          kubectl taint nodes --all node-role.kubernetes.io/master-
+          kubectl create -f crds.yaml 
+          kubectl create -f common.yaml
+          kubectl create -f operator.yaml
+          kubectl create -f cluster.yaml
+          kubectl create -f storageclass.yaml
+          kubectl patch storageclass rook-ceph-block -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+    - name: kubesphere-deploy # release 3.0 official
+      inputs:
+        artifacts:
+          - name: k8s-state
+            path: /src
+      script:
+        image: "enginsgungor/kubemanager:v1"
+        command: [sh]
+        source: |
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig
+          kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.0.0/kubesphere-installer.yaml
+          kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.0.0/cluster-configuration.yaml
+          kubectl patch cc -n kubesphere-system ks-installer --type merge -p '{"spec":{"devops":{"enabled": true}}}'  
+          kubectl -n rook-ceph get pods
+          kubectl get sc
+    - name: kubesphere-report # release 3.0 official
+      inputs:
+        artifacts:
+          - name: k8s-state
+            path: /src
+      script:
+        image: "enginsgungor/kubemanager:v1"
+        command: [sh]
+        source: |
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig
+          kubectl logs -n kubesphere-system $(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath='{.items[0].metadata.name}') -f
+    - name: ansible-docker-edit
+      inputs:
+        artifacts:
+          - name: ssh-key
+            path: /home/ansible/keys
+          - name: k8s-state
+            path: /src
+          - name: ansible-repo
+            path: /home/ansible
+            git:
+              repo: https://github.com/esgungor/Ansible-Repo
+              revision: "master"
+      script:
+        image: "enginsgungor/ansible:v3"
+        command: [sh]
+        source: |
+          export ANSIBLE_HOST_KEY_CHECKING=False
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig
+          export MASTER_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[1].address}")
+          echo "[cluster]" >> /etc/ansible/hosts
+          kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[1].address}{"\n"}' >> /etc/ansible/hosts
+          echo "[cluster:vars]" >> /etc/ansible/hosts
+          echo "ansible_python_interpreter=/usr/bin/python3" >> /etc/ansible/hosts
+          echo "ansible_ssh_user=root" >> /etc/ansible/hosts
+          echo "ansible_ssh_private_key_file=/home/ansible/keys/key" >> /etc/ansible/hosts
+          cd /home/ansible
+          ansible-playbook ansible.yml
+    - name: app-install
+      inputs:
+        artifacts:
+          - name: k8s-state
+            path: /src
+          - name: chart-values
+            path: /home/chart
+            git:
+              repo: https://github.com/ProvEdge/Gitea-Values.git
+              revision: "master"
+      script:
+        image: "enginsgungor/kubemanager:v2"
+        command: [sh]
+        source: |
+          cd /home/chart
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig
+          kubectl create ns pipeline
+          export MASTER_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[1].address}")
+
+          helm repo add gitea-charts https://dl.gitea.io/charts/ 
+          helm install gitea gitea-charts/gitea -f values.yaml --namespace pipeline --set gitea.config.server.DOMAIN=$MASTER_IP --set gitea.config.server.ROOT_URL=http://$MASTER_IP:31024 --set gitea.config.server.SSH_PORT=31025
+
+          helm repo add harbor https://helm.goharbor.io
+          helm install harbor --namespace pipeline harbor/harbor --set expose.tls.enabled=false --set expose.type=nodePort --set externalURL=http://$MASTER_IP:30002
+
+          helm upgrade --install sonarqube sonarqube --repo https://charts.kubesphere.io/main -n kubesphere-devops-system  --create-namespace --set service.type=NodePort
+          kubectl -n pipeline rollout status deployment harbor-harbor-core
+          curl -X PUT -u "admin:Harbor12345" -H "Content-Type: application/json" -ki http://$MASTER_IP:30002/api/v2.0/configurations -d'{"auth_mode":"ldap_auth","ldap_url":"ldap://openldap.kubesphere-system.svc:389","ldap_base_dn":"dc=kubesphere,dc=io","ldap_search_dn":"cn=admin,dc=kubesphere,dc=io","ldap_search_password":"admin","ldap_uid":"uid"}'
+
+    - name: kubesphere-integrator
+      inputs:
+        artifacts:
+          - name: k8s-state
+            path: /src
+      script:
+        image: "enginsgungor/kubemanager:v2"
+        command: [sh]
+        source: |
+          cd home
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig
+          export MASTER_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[1].address}")
+          kubectl -n kubesphere-devops-system rollout status deployment sonarqube-sonarqube
+          kubectl -n kubesphere-devops-system rollout status deployment ks-jenkins
+
+          export NODE_PORT=$(kubectl get --namespace kubesphere-devops-system -o jsonpath="{.spec.ports[0].nodePort}" services sonarqube-sonarqube)
+          export NODE_IP=$(kubectl get nodes --namespace kubesphere-devops-system -o jsonpath="{.items[0].status.addresses[1].address}")
+          export TOKEN=$(curl -u admin:admin -X POST -d "name=kubesphere" http://$MASTER_IP:$NODE_PORT/api/user_tokens/generate | jq -r '.token') ## api_token
+          echo $TOKEN
+          kubectl patch cc -n kubesphere-system ks-installer --type merge -p '{"spec":{"devops":{"sonarqube":{"externalSonarUrl":"http://'${NODE_IP}':'${NODE_PORT}'","externalSonarToken":"'${TOKEN}'"}}}}'
+          kubectl patch cm -n kubesphere-system  ks-console-config -p '{"data":{"local_config.yaml": "server:\n  http:\n    hostname: localhost\n    port: 8000\n    static:\n      production:\n        /public: server/public\n        /assets: dist/assets\n        /dist: dist\n  redis:\n    port: 6379\n    host: redis.kubesphere-system.svc\n  redisTimeout: 5000\n  sessionTimeout: 7200000\nclient:\n  version:\n    kubesphere: v3.0.0\n    kubernetes: v1.18.6\n    openpitrix: v0.3.5\n  enableKubeConfig: true\n  devops:\n    sonarqubeURL: http://'${MASTER_IP}':'${NODE_PORT}'\n"}}'
+          curl -u admin:admin -X POST -d "name=ks-jenkins" -d "url=http://$NODE_IP:30180/sonarqube-webhook" http://$MASTER_IP:$NODE_PORT/api/webhooks/create
+          kubectl -n kubesphere-devops-system set env deployment/ks-jenkins SONAR_ENABLED='true'
+          kubectl -n kubesphere-devops-system set env deployment/ks-jenkins SONAR_SERVER_URL='http://'${NODE_IP}':'${NODE_PORT}''
+          kubectl -n kubesphere-devops-system set env deployment/ks-jenkins SONAR_AUTH_TOKEN=''${TOKEN}''
+          kubectl -n kubesphere-system rollout restart deploy ks-apiserver
+          kubectl -n kubesphere-system rollout restart deploy ks-console
+    - name: ssl-cert
+      inputs:
+        artifacts:
+          - name: k8s-state
+            path: /src
+      outputs:
+        artifacts:
+          - name: certs
+            path: /home/ssl
+      script:
+        image: "enginsgungor/kubemanager:v2"
+        command: [sh]
+        source: |
+          cd home
+          mkdir -p ssl
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig
+          export MASTER_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[1].address}")
+          cat << EOF > ssl/req.cnf
+          [req]
+          req_extensions = v3_req
+          distinguished_name = req_distinguished_name
+
+          [req_distinguished_name]
+
+          [ v3_req ]
+          basicConstraints = CA:FALSE
+          keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+          subjectAltName = @alt_names
+
+          [alt_names]
+          IP.1 = $MASTER_IP
+          EOF
+          openssl genrsa -out ssl/ca-key.pem 2048
+          openssl req -x509 -new -nodes -key ssl/ca-key.pem -days 10 -out ssl/ca.pem -subj "/CN=kube-ca"
+
+          openssl genrsa -out ssl/key.pem 2048
+          openssl req -new -key ssl/key.pem -out ssl/csr.pem -subj "/CN=kube-ca" -config ssl/req.cnf
+          openssl x509 -req -in ssl/csr.pem -CA ssl/ca.pem -CAkey ssl/ca-key.pem -CAcreateserial -out ssl/cert.pem -days 10 -extensions v3_req -extfile ssl/req.cnf
+          mv ssl/ca.pem ssl/dex.pem
+
+          kubectl create ns kubeapps
+          kubectl create ns dex
+          kubectl create -n dex secret tls dex.example.com.tls --cert=ssl/cert.pem --key=ssl/key.pem
+          kubectl create -n kubeapps secret tls kubeappstls --cert=ssl/cert.pem --key=ssl/key.pem
+    - name: api-server
+      inputs:
+        artifacts:
+          - name: ssh-key
+            path: /home/ansible/keys
+          - name: k8s-state
+            path: /src
+          - name: certs
+            path: /home/ssl
+          - name: ansible-repo
+            path: /home/ansible
+            git:
+              repo: https://github.com/esgungor/Ansible-Repo
+              revision: "master"
+      script:
+        image: "enginsgungor/ansible:v3"
+        command: [sh]
+        source: |
+          export ANSIBLE_HOST_KEY_CHECKING=False
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig
+          export MASTER_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[1].address}")
+          echo "[cluster]" >> /etc/ansible/hosts
+          kubectl get node --selector='node-role.kubernetes.io/master' -o jsonpath='{range .items[*]}{.status.addresses[1].address}{"\n"}' >> /etc/ansible/hosts
+          echo "[cluster:vars]" >> /etc/ansible/hosts
+          echo "ansible_python_interpreter=/usr/bin/python3" >> /etc/ansible/hosts
+          echo "ansible_ssh_user=root" >> /etc/ansible/hosts
+          echo "ansible_ssh_private_key_file=/home/ansible/keys/key" >> /etc/ansible/hosts
+          cd /home/ansible
+          ansible-playbook api.yml
+    - name: dex-kubeapps
+      inputs:
+        artifacts:
+          - name: k8s-state
+            path: /src
+          - name: dex
+            path: /home/dex
+            git:
+              repo: https://github.com/ProvEdge/dex-preconfigured.git
+              revision: "master"
+      script:
+        image: "enginsgungor/kubemanager:v2"
+        command: [sh]
+        source: |
+          cd /home/dex
+          export KUBECONFIG=/src/{{workflow.parameters.clustername}}-kubeconfig
+          export MASTER_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[1].address}")
+          sed -i 's/CHANGE_MASTER_IP/'${MASTER_IP}'/' dex.yaml
+          kubectl apply -f dex.yaml
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm install kubeapps bitnami/kubeapps --set ingress.enabled=true --set ingress.tls=true --namespace kubeapps --set authProxy.enabled=true --set authProxy.provider=oidc --set authProxy.clientID=kubeapps --set authProxy.clientSecret=my-client-secret --set authProxy.cookieSecret=$(echo "not-good-secret" | base64) --set authProxy.additionalFlags="{--cookie-secure=false,--oidc-issuer-url=https://${MASTER_IP}:32000}"
+          kubectl patch deployment -n kubeapps kubeapps --patch '{"spec": {"template": {"spec": {"volumes": [{ "name":"tls","secret":{"secretName":"kubeappstls"} }]}}}}'
+          kubectl patch deployment -n kubeapps kubeapps -p '{"spec":{"template":{"spec":{"containers":[{"name":"auth-proxy","volumeMounts":[{"name":"tls","mountPath":"/etc/ssl/certs"}]}]}}}}'
